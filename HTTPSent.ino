@@ -62,6 +62,9 @@ const unsigned long mixingDuration = 10000;   // 10 วินาที
 bool fillingTimerStarted = false;  // ตัวแปรตรวจสอบว่าเริ่มจับเวลา Filling แล้วหรือยัง
 bool mixingTimerStarted = false;   // ตัวแปรตรวจสอบว่าเริ่มจับเวลา Mixing แล้วหรือยัง
 
+// ตัวแปรสำหรับเก็บสถานะ batch เสร็จสมบูรณ์
+bool batchComplete = false;  // เพิ่มตัวแปรเพื่อเก็บสถานะ batch เสร็จสมบูรณ์
+
 // ตัวแปรสำหรับเก็บค่าก่อนหน้า (เพื่อตรวจสอบการเปลี่ยนแปลง)
 int prevMaterialCount = -1;
 int prevBatchCount = -1;
@@ -295,7 +298,7 @@ bool ensureSasToken() {
   return true;
 }
 
-// ฟังก์ชันส่ง telemetry ผ่าน HTTP
+// ฟังก์ชันส่ง telemetry ผ่าน HTTP (ปรับเพื่อเพิ่ม batchComplete)
 bool sendTelemetry() {
   float temp = dht1.readTemperature();
   float hum = dht1.readHumidity();
@@ -324,6 +327,8 @@ bool sendTelemetry() {
   doc["batchNumber"] = batchNumber;
   doc["tempMax"] = tempMax;
   doc["tempMin"] = tempMin;
+  doc["batchComplete"] = batchComplete;  // เพิ่ม batchComplete ใน JSON payload
+
   String payload;
   serializeJson(doc, payload);
 
@@ -355,6 +360,8 @@ bool sendTelemetry() {
     Serial.println(batchCount);
     Serial.print("Final Count: ");
     Serial.println(finalCount);
+    Serial.print("Batch Complete: ");
+    Serial.println(batchComplete ? "true" : "false");
     http.end();
     return true;
   } else {
@@ -418,7 +425,7 @@ String getDataAsJson(float temp1, float humidity1, float finalTemp, float finalH
   return json;
 }
 
-// หน้าเว็บ (ปรับการจัดวางตามลำดับใหม่)
+// หน้าเว็บ (ไม่เปลี่ยนแปลง)
 String getHTML() {
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Conveyor Dashboard</title>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
@@ -695,6 +702,7 @@ void loop() {
       step5Status = "Waiting";
       fillingTimerStarted = false;
       mixingTimerStarted = false;
+      batchComplete = false;  // รีเซ็ต batchComplete
       client.println("HTTP/1.1 303 See Other");
       client.println("Location: /data");
       client.println();
@@ -718,6 +726,7 @@ void loop() {
       step5Status = "Waiting";
       fillingTimerStarted = false;
       mixingTimerStarted = false;
+      batchComplete = false;  // รีเซ็ต batchComplete
       client.println("HTTP/1.1 303 See Other");
       client.println("Location: /data");
       client.println();
@@ -910,6 +919,24 @@ void loop() {
       Serial.print("Step 5 - Items After Mixing: ");
       Serial.println(finalCount);
       if (finalCount >= batchSize) {
+        // ตั้งค่า batchComplete เป็น true ก่อนส่ง telemetry
+        batchComplete = true;
+        Serial.println("Batch completed. Sending telemetry with batchComplete = true");
+
+        // ส่ง telemetry เมื่อ batch เสร็จสมบูรณ์
+        if (isWiFiConnected && isTimeSynced && isProvisioned) {
+          if (sendTelemetry()) {
+            Serial.println("Batch telemetry sent successfully!");
+            batchComplete = false;  // รีเซ็ต batchComplete หลังจากส่งสำเร็จ
+            Serial.println("batchComplete reset to false for next batch");
+          } else {
+            Serial.println("Failed to send batch telemetry. Will retry on next cycle.");
+          }
+        } else {
+          Serial.println("Skipping batch telemetry: Not fully connected");
+          batchComplete = false;  // รีเซ็ต batchComplete เพื่อป้องกันการส่งซ้ำ
+        }
+
         batchNumber++;  // เพิ่ม batchNumber หลังจาก Step 5 เสร็จ
         Serial.print("Batch Number incremented to: ");
         Serial.println(batchNumber);
@@ -946,10 +973,12 @@ void loop() {
     Serial.println(batchCount);
     Serial.print("Batch Number: ");
     Serial.println(batchNumber);
+    Serial.print("Batch Complete: ");
+    Serial.println(batchComplete ? "true" : "false");
     lastDebug = millis();
   }
 
-  // ส่ง Telemetry
+  // ส่ง Telemetry ทุก 30 วินาที (เหมือนเดิม)
   static unsigned long lastTelemetry = 0;
   if (millis() - lastTelemetry > 30000) {
     Serial.println("Checking telemetry...");
