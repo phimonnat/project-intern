@@ -8,16 +8,16 @@
 #include "iot_configs.h"
 
 // กำหนด DHT
-#define DHTPIN1 4  // DHT22 ตัวที่ 1 สำหรับ Step 2 (ระหว่างเติม)
-#define DHTPIN2 15 // DHT22 ตัวที่ 2 สำหรับ Step 4 (หลังเติม)
+#define DHTPIN1 4  // DHT22 ตัวที่ 1 สำหรับ Step 1 (รวม Environment Monitoring)
+#define DHTPIN2 15 // DHT22 ตัวที่ 2 สำหรับ Step 3 (รวมกับ Items After Filling)
 #define DHTTYPE DHT22
 DHT dht1(DHTPIN1, DHTTYPE);
 DHT dht2(DHTPIN2, DHTTYPE);
 
 // กำหนด IR Sensor
 #define IR_PIN_1 13  // สำหรับ Step 1: นับวัตถุดิบ
-#define IR_PIN_2 14  // สำหรับ Step 5: นับสินค้าหลังเติม (IR Sensor 2)
-#define IR_PIN_3 12  // สำหรับ Step 6: นับสินค้าหลังผสม (IR Sensor 3)
+#define IR_PIN_2 14  // สำหรับ Step 3: นับสินค้าหลังเติม (IR Sensor 2)
+#define IR_PIN_3 12  // สำหรับ Step 5: นับสินค้าหลังผสม (IR Sensor 3)
 
 // WiFi credentials
 const char* ssid = IOT_CONFIG_WIFI_SSID;
@@ -37,6 +37,8 @@ unsigned long sasTokenExpiry = 0;
 // ตัวแปรสำหรับเก็บข้อมูล
 float temperature1 = -1;  // เก็บค่าล่าสุดจาก DHT22 ตัวที่ 1
 float humidity1 = -1;     // เก็บค่าล่าสุดจาก DHT22 ตัวที่ 1
+float finalBatchTemp = -1.0;  // อุณหภูมิสุดท้ายจาก DHT22 ตัวที่ 2
+float finalBatchHumidity = -1.0;  // ความชื้นสุดท้ายจาก DHT22 ตัวที่ 2
 int materialCount = 0;
 int batchCount = 0;
 int finalCount = 0;
@@ -49,17 +51,33 @@ const int materialTarget = 3;
 const int batchSize = 10;
 float tempMax = -100.0;
 float tempMin = 100.0;
-float finalBatchTemp = -1.0;  // อุณหภูมิสุดท้ายของแบทช์ (จาก DHT22 ตัวที่ 2)
 const float tempLimit = 55.0;
-int processPhase = 0;  // 0: Material Count, 1: Items After Filling, 2: Mixing Process, 3: Items After Mixing
+int processPhase = 0;  // 0: Material Count, 1: Filling Process, 2: Items After Filling, 3: Mixing Process, 4: Items After Mixing
+
+// ตัวแปรสำหรับจับเวลา (สมมติระยะเวลา 10 วินาที)
+unsigned long fillingStartTime = 0;  // เวลาเริ่มต้นของ Filling Process
+unsigned long mixingStartTime = 0;   // เวลาเริ่มต้นของ Mixing Process
+const unsigned long fillingDuration = 10000;  // 10 วินาที
+const unsigned long mixingDuration = 10000;   // 10 วินาที
+bool fillingTimerStarted = false;  // ตัวแปรตรวจสอบว่าเริ่มจับเวลา Filling แล้วหรือยัง
+bool mixingTimerStarted = false;   // ตัวแปรตรวจสอบว่าเริ่มจับเวลา Mixing แล้วหรือยัง
+
+// ตัวแปรสำหรับเก็บค่าก่อนหน้า (เพื่อตรวจสอบการเปลี่ยนแปลง)
+int prevMaterialCount = -1;
+int prevBatchCount = -1;
+int prevFinalCount = -1;
+float prevTemperature1 = -2;
+float prevHumidity1 = -2;
+float prevFinalBatchTemp = -2;
+float prevFinalBatchHumidity = -2;
 
 // ตัวแปรสถานะของแต่ละ Step
 String step1Status = "Waiting";  // Step 1: Material Count
-String step2Status = "Waiting";  // Step 2: Environment Monitoring
-String step3Status = "Waiting";  // Step 3: Filling Process
-String step4Status = "Waiting";  // Step 4: Final Temperature Check
-String step5Status = "Waiting";  // Step 5: Items After Filling
-String step6Status = "Waiting";  // Step 6: Items After Mixing
+String step1EnvStatus = "Waiting";  // Step 1: Environment Monitoring (แยกสถานะ)
+String step2Status = "Waiting";  // Step 2: Filling Process
+String step3Status = "Waiting";  // Step 3: Items After Filling
+String step4Status = "Waiting";  // Step 4: Mixing Process
+String step5Status = "Waiting";  // Step 5: Items After Mixing
 
 // ตัวแปรสำหรับการจัดการเวลา
 #define PST_TIME_ZONE 7
@@ -73,6 +91,7 @@ bool isWiFiConnected = false;
 bool isTimeSynced = false;
 bool isProvisioned = false;
 bool isFirstLoop = true;
+bool isFirstWebSocket = true;  // เพื่อส่ง WebSocket ครั้งแรกเมื่อผู้ใช้เข้าหน้าเว็บ
 
 // ฟังก์ชันเชื่อมต่อ WiFi
 bool connect_to_wifi() {
@@ -297,6 +316,7 @@ bool sendTelemetry() {
   doc["temperature1"] = temperature1;
   doc["humidity1"] = humidity1;
   doc["finalBatchTemp"] = finalBatchTemp;
+  doc["finalBatchHumidity"] = finalBatchHumidity;
   doc["materialCount"] = materialCount;
   doc["batchCount"] = batchCount;
   doc["finalCount"] = finalCount;
@@ -326,7 +346,9 @@ bool sendTelemetry() {
     Serial.println(" %");
     Serial.print("Final Batch Temperature (DHT2): ");
     Serial.print(finalBatchTemp);
-    Serial.println(" C");
+    Serial.print(" C, Final Batch Humidity (DHT2): ");
+    Serial.print(finalBatchHumidity);
+    Serial.println(" %");
     Serial.print("Material Count: ");
     Serial.println(materialCount);
     Serial.print("Batch Count: ");
@@ -348,9 +370,11 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
   switch(type) {
     case WStype_DISCONNECTED:
       Serial.printf("WebSocket Client [%u] Disconnected\n", num);
+      isFirstWebSocket = true;  // รีเซ็ตเมื่อผู้ใช้หลุด เพื่อส่งข้อมูลใหม่เมื่อเชื่อมต่อใหม่
       break;
     case WStype_CONNECTED:
       Serial.printf("WebSocket Client [%u] Connected\n", num);
+      isFirstWebSocket = true;  // ส่งข้อมูลทันทีเมื่อผู้ใช้เชื่อมต่อ
       break;
     case WStype_TEXT:
       break;
@@ -358,7 +382,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
 }
 
 // ฟังก์ชันสร้าง JSON สำหรับส่งผ่าน WebSocket
-String getDataAsJson(float temp1, float humidity1, float finalTemp, String materialStatus, String batchStatus, String finalStatus, String tempStatus, String tempAlert) {
+String getDataAsJson(float temp1, float humidity1, float finalTemp, float finalHumidity, String materialStatus, String batchStatus, String finalStatus, String tempStatus, String tempAlert) {
   DynamicJsonDocument doc(512);
   doc["materialCount"] = materialCount;
   doc["materialStatus"] = materialStatus;
@@ -367,6 +391,7 @@ String getDataAsJson(float temp1, float humidity1, float finalTemp, String mater
   doc["tempMax"] = tempMax;
   doc["tempMin"] = tempMin;
   doc["finalBatchTemp"] = finalTemp;
+  doc["finalBatchHumidity"] = finalHumidity;
   doc["tempStatus"] = tempStatus;
   doc["tempAlert"] = tempAlert;
   doc["batchCount"] = batchCount;
@@ -376,108 +401,117 @@ String getDataAsJson(float temp1, float humidity1, float finalTemp, String mater
   doc["totalItems"] = totalItems;
   doc["batchNumber"] = batchNumber;
   doc["processPhase"] = processPhase == 0 ? "Phase 1 (Material Count)" : 
-                       processPhase == 1 ? "Phase 2 (Items After Filling)" : 
-                       processPhase == 2 ? "Phase 3 (Mixing Process)" : 
-                       "Phase 4 (Items After Mixing)";
+                       processPhase == 1 ? "Phase 2 (Filling Process)" : 
+                       processPhase == 2 ? "Phase 3 (Items After Filling)" : 
+                       processPhase == 3 ? "Phase 4 (Mixing Process)" : 
+                       "Phase 5 (Items After Mixing)";
   // เพิ่มสถานะของแต่ละ Step
   doc["step1Status"] = step1Status;
+  doc["step1EnvStatus"] = step1EnvStatus;
   doc["step2Status"] = step2Status;
   doc["step3Status"] = step3Status;
   doc["step4Status"] = step4Status;
   doc["step5Status"] = step5Status;
-  doc["step6Status"] = step6Status;
 
   String json;
   serializeJson(doc, json);
   return json;
 }
 
-// หน้าเว็บ (ออกแบบใหม่)
+// หน้าเว็บ (ปรับการจัดวางตามลำดับใหม่)
 String getHTML() {
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Conveyor Dashboard</title>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<style>";
-  html += "body { font-family: Arial, sans-serif; background-color: #f5f5f5; margin: 0; padding: 20px; color: #333; }";
-  html += "h1 { color: #1a3c5a; text-align: center; font-size: 2.5em; margin-bottom: 20px; }";
-  html += ".container { max-width: 800px; margin: 0 auto; }";
-  html += ".section { background-color: #fff; border: 2px solid #ddd; padding: 20px; margin-bottom: 20px; border-radius: 5px; position: relative; }";
-  html += ".section h2 { color: #1a3c5a; font-size: 1.8em; margin: 0 0 10px 0; }";
-  html += ".data { font-size: 1.5em; margin: 10px 0; display: flex; align-items: center; gap: 10px; }";
-  html += ".data-label { font-weight: bold; color: #333; }";
-  html += ".data-value { font-size: 2em; font-weight: bold; }";
-  html += ".status-indicator { width: 20px; height: 20px; border-radius: 50%; display: inline-block; margin-right: 10px; }";
-  html += ".status-waiting .status-indicator { background-color: #ccc; }";
-  html += ".status-active .status-indicator { background-color: #ff9800; }";
-  html += ".status-completed .status-indicator { background-color: #28a745; }";
-  html += ".status-error .status-indicator { background-color: #dc3545; }";
-  html += ".status-text { font-size: 1.2em; font-weight: bold; }";
-  html += ".status-pass { color: #28a745; }";
-  html += ".status-fail { color: #dc3545; }";
-  html += ".alert { background-color: #dc3545; color: white; padding: 10px; text-align: center; font-size: 1.5em; margin: 10px 0; font-weight: bold; border-radius: 5px; }";
-  html += ".buttons { display: flex; justify-content: center; gap: 20px; margin-top: 20px; }";
-  html += "button { padding: 15px 40px; font-size: 1.5em; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.3s; font-weight: bold; }";
-  html += ".reset-batch { background-color: #dc3545; color: white; }";
-  html += ".reset-batch:hover { background-color: #c82333; }";
+  html += "body { font-family: Arial, sans-serif; background-color: #f8fafc; margin: 0; padding: 20px; color: #1a202c; box-sizing: border-box; }";
+  html += "h1 { color: #1a202c; text-align: center; font-size: 2.5rem; margin-bottom: 20px; font-weight: bold; }";
+  html += ".container { width: 90%; max-width: 1400px; margin: 0 auto; }";
+  html += ".overview { background-color: #e2e8f0; border-radius: 8px; padding: 10px; text-align: center; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }";
+  html += ".overview h2 { font-size: 1.6rem; color: #1a202c; margin: 0 0 8px 0; font-weight: 600; }";
+  html += ".overview .data { justify-content: center; border-bottom: none; }";
+  html += ".overview .data-label { min-width: 120px; font-weight: 600; }";
+  html += ".overview .data-value { font-size: 1.4rem; font-weight: bold; color: #1a202c; }";
+  html += ".sections-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }";
+  html += ".section { background-color: #fff; border: 1px solid #e2e8f0; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }";
+  html += ".section.compact { padding: 10px; min-height: 80px; }"; // สำหรับ Step 2 และ Step 4 ที่มีข้อมูลน้อย
+  html += ".section h2 { color: #1a202c; font-size: 1.6rem; margin: 0 0 12px 0; font-weight: 600; text-align: center; }";
+  html += ".data { font-size: 1rem; margin: 10px 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid #e2e8f0; padding-bottom: 8px; }";
+  html += ".data:last-child { border-bottom: none; }";
+  html += ".data-label { min-width: 150px; font-weight: 600; color: #4a5568; font-size: 1rem; }";
+  html += ".data-value { font-size: 1.4rem; font-weight: bold; color: #1a202c; flex: 1; text-align: left; }";
+  html += ".status-container { display: flex; align-items: center; gap: 10px; }";
+  html += ".status-indicator { width: 16px; height: 16px; border-radius: 50%; display: inline-block; margin-right: 10px; }";
+  html += ".status-waiting .status-indicator { background-color: #a0aec0; }";
+  html += ".status-active .status-indicator { background-color: #f6ad55; }";
+  html += ".status-completed .status-indicator { background-color: #38a169; }";
+  html += ".status-error .status-indicator { background-color: #e53e3e; }";
+  html += ".status-text { font-size: 1.1rem; font-weight: 600; min-width: 100px; text-align: left; }";
+  html += ".status-pass { color: #38a169; }";
+  html += ".status-fail { color: #e53e3e; }";
+  html += ".description { font-size: 0.9rem; color: #4a5568; margin-top: 5px; text-align: center; }"; // สำหรับคำอธิบาย
+  html += ".alert { background-color: #e53e3e; color: white; padding: 8px; text-align: center; font-size: 1.2rem; margin: 8px 0; font-weight: bold; border-radius: 8px; }";
+  html += ".buttons { display: flex; justify-content: center; gap: 15px; margin-top: 20px; }";
+  html += "button { padding: 10px 30px; font-size: 1.2rem; border: none; border-radius: 8px; cursor: pointer; transition: background-color 0.3s; font-weight: bold; }";
+  html += ".reset-batch { background-color: #007bff; color: white; }";
+  html += ".reset-batch:hover { background-color: #0056b3; }";
   html += ".reset-total { background-color: #ff9800; color: white; }";
   html += ".reset-total:hover { background-color: #e68a00; }";
-  html += "@media (max-width: 768px) { h1 { font-size: 2em; } .section { padding: 15px; } .data { font-size: 1.2em; } .data-value { font-size: 1.8em; } button { padding: 10px 30px; font-size: 1.2em; } }";
   html += "</style></head><body>";
 
   html += "<div class='container'>";
   html += "<h1>Conveyor Dashboard</h1>";
 
   // Process Overview (ภาพรวม)
-  html += "<div class='section'>";
+  html += "<div class='overview'>";
   html += "<h2>Process Overview</h2>";
   html += "<div class='data'><span class='data-label'>Current Phase:</span><span class='data-value' id='processPhase'>Phase 1 (Material Count)</span></div>";
   html += "</div>";
 
-  // Step 1: Material Count
-  html += "<div class='section status-waiting' id='step1'>";
-  html += "<h2>Step 1: Material Count</h2>";
-  html += "<div class='data'><span class='status-indicator'></span><span class='status-text' id='step1Status'>Waiting</span></div>";
-  html += "<div class='data'><span class='data-label'>Sensor:</span><span class='data-value'>IR Sensor 1 (GPIO 13)</span></div>";
-  html += "<div class='data'><span class='data-label'>Count:</span><span class='data-value' id='materialCount'>0 / 3</span><span class='status-text status-pass' id='materialStatus'></span></div>";
-  html += "</div>";
+  // Sections Grid (จัด Step เป็น 2 คอลัมน์)
+  html += "<div class='sections-grid'>";
 
-  // Step 2: Environment Monitoring During Filling
-  html += "<div class='section status-waiting' id='step2'>";
-  html += "<h2>Step 2: Environment Monitoring</h2>";
-  html += "<div class='data'><span class='status-indicator'></span><span class='status-text' id='step2Status'>Waiting</span></div>";
-  html += "<div class='data'><span class='data-label'>Sensor:</span><span class='data-value'>DHT22 Sensor 1 (GPIO 4)</span></div>";
+  // คอลัมน์ซ้าย: Step 1, Step 2, Step 3
+  // Step 1: Material Count & Environment
+  html += "<div class='section status-waiting' id='step1'>";
+  html += "<h2>Step 1: Material Count & Environment</h2>";
+  html += "<div class='data'><span class='data-label'>Material Count Status:</span><div class='status-container'><span class='status-indicator'></span><span class='status-text' id='step1Status'>Waiting</span></div></div>";
+  html += "<div class='data'><span class='data-label'>Count:</span><span class='data-value' id='materialCount'>0 / 3</span><span class='status-text status-pass' id='materialStatus'></span></div>";
+  html += "<div class='data'><span class='data-label'>Environment Status:</span><div class='status-container'><span class='status-indicator'></span><span class='status-text' id='step1EnvStatus'>Waiting</span></div></div>";
   html += "<div class='data'><span class='data-label'>Temperature:</span><span class='data-value' id='temperature1'>Error</span></div>";
   html += "<div class='data'><span class='data-label'>Humidity:</span><span class='data-value' id='humidity1'>Error</span></div>";
+  html += "<div class='data'><span class='data-label'>Max Temp:</span><span class='data-value' id='tempMax'>-</span></div>";
+  html += "<div class='data'><span class='data-label'>Min Temp:</span><span class='data-value' id='tempMin'>-</span></div>";
   html += "</div>";
 
-  // Step 3: Filling Process
+  // Step 2: Filling Process
+  html += "<div class='section compact status-waiting' id='step2'>";
+  html += "<h2>Step 2: Filling Process</h2>";
+  html += "<div class='data'><span class='data-label'>Status:</span><div class='status-container'><span class='status-indicator'></span><span class='status-text' id='step2Status'>Waiting</span></div></div>";
+  html += "<div class='description'>Preparing items for filling.</div>";
+  html += "</div>";
+
+  // Step 3: Items After Filling
   html += "<div class='section status-waiting' id='step3'>";
-  html += "<h2>Step 3: Filling Process</h2>";
-  html += "<div class='data'><span class='status-indicator'></span><span class='status-text' id='step3Status'>Waiting</span></div>";
-  html += "<div class='data'><span class='data-label'>Sensor:</span><span class='data-value'>No sensor used</span></div>";
-  html += "</div>";
-
-  // Step 5: Items After Filling
-  html += "<div class='section status-waiting' id='step5'>";
-  html += "<h2>Step 4: Items After Filling</h2>";
-  html += "<div class='data'><span class='status-indicator'></span><span class='status-text' id='step5Status'>Waiting</span></div>";
-  html += "<div class='data'><span class='data-label'>Sensor:</span><span class='data-value'>IR Sensor 2 (GPIO 14)</span></div>";
+  html += "<h2>Step 3: Items After Filling</h2>";
+  html += "<div class='data'><span class='data-label'>Status:</span><div class='status-container'><span class='status-indicator'></span><span class='status-text' id='step3Status'>Waiting</span></div></div>";
   html += "<div class='data'><span class='data-label'>Count:</span><span class='data-value' id='batchCount'>0 / 10</span><span class='status-text status-pass' id='batchStatus'></span></div>";
-  html += "</div>";
-
-  // Step 4: Final Temperature Check After Filling (ย้ายมาหลัง Step 5)
-  html += "<div class='section status-waiting' id='step4'>";
-  html += "<h2>Step 5: Final Temperature Check</h2>";
-  html += "<div class='data'><span class='status-indicator'></span><span class='status-text' id='step4Status'>Waiting</span></div>";
-  html += "<div class='data'><span class='data-label'>Sensor:</span><span class='data-value'>DHT22 Sensor 2 (GPIO 15)</span></div>";
   html += "<div class='data'><span class='data-label'>Temperature:</span><span class='data-value' id='finalBatchTemp'>Error</span><span class='status-text status-pass' id='tempStatus'></span></div>";
-  html += "<div class='alert' id='tempAlert' style='display:none;'>Temperature Warning</div>";
+  html += "<div class='data'><span class='data-label'>Humidity:</span><span class='data-value' id='finalBatchHumidity'>Error</span></div>";
+  html += "<div class='alert' id='tempAlert' style='display:none;'>Fail</div>";
   html += "</div>";
 
-  // Step 6: Items After Mixing
-  html += "<div class='section status-waiting' id='step6'>";
-  html += "<h2>Step 6: Items After Mixing</h2>";
-  html += "<div class='data'><span class='status-indicator'></span><span class='status-text' id='step6Status'>Waiting</span></div>";
-  html += "<div class='data'><span class='data-label'>Sensor:</span><span class='data-value'>IR Sensor 3 (GPIO 12)</span></div>";
+  // คอลัมน์ขวา: Step 4, Step 5, Summary
+  // Step 4: Mixing Process
+  html += "<div class='section compact status-waiting' id='step4'>";
+  html += "<h2>Step 4: Mixing Process</h2>";
+  html += "<div class='data'><span class='data-label'>Status:</span><div class='status-container'><span class='status-indicator'></span><span class='status-text' id='step4Status'>Waiting</span></div></div>";
+  html += "<div class='description'>Mixing items to ensure quality.</div>";
+  html += "</div>";
+
+  // Step 5: Items After Mixing
+  html += "<div class='section status-waiting' id='step5'>";
+  html += "<h2>Step 5: Items After Mixing</h2>";
+  html += "<div class='data'><span class='data-label'>Status:</span><div class='status-container'><span class='status-indicator'></span><span class='status-text' id='step5Status'>Waiting</span></div></div>";
   html += "<div class='data'><span class='data-label'>Count:</span><span class='data-value' id='finalCount'>0 / 10</span><span class='status-text status-pass' id='finalStatus'></span></div>";
   html += "</div>";
 
@@ -487,6 +521,8 @@ String getHTML() {
   html += "<div class='data'><span class='data-label'>Total Items:</span><span class='data-value' id='totalItems'>0</span></div>";
   html += "<div class='data'><span class='data-label'>Batch Number:</span><span class='data-value' id='batchNumber'>1</span></div>";
   html += "</div>";
+
+  html += "</div>"; // ปิด sections-grid
 
   // Buttons
   html += "<div class='buttons'>";
@@ -510,7 +546,10 @@ String getHTML() {
   html += "  document.getElementById('materialStatus').className = 'status-text status-' + (data.materialStatus == 'OK' ? 'pass' : 'fail');";
   html += "  document.getElementById('temperature1').innerText = data.temperature1 == -1 ? 'Error' : (data.temperature1 + ' C');";
   html += "  document.getElementById('humidity1').innerText = data.humidity1 == -1 ? 'Error' : (data.humidity1 + ' %');";
+  html += "  document.getElementById('tempMax').innerText = data.tempMax == -100 ? '-' : (data.tempMax + ' C');";
+  html += "  document.getElementById('tempMin').innerText = data.tempMin == 100 ? '-' : (data.tempMin + ' C');";
   html += "  document.getElementById('finalBatchTemp').innerText = data.finalBatchTemp == -1 ? 'Error' : (data.finalBatchTemp + ' C');";
+  html += "  document.getElementById('finalBatchHumidity').innerText = data.finalBatchHumidity == -1 ? 'Error' : (data.finalBatchHumidity + ' %');";
   html += "  document.getElementById('tempStatus').innerText = data.tempStatus;";
   html += "  document.getElementById('tempStatus').className = 'status-text status-' + (data.tempStatus == 'Pass' ? 'pass' : 'fail');";
   html += "  let tempAlert = document.getElementById('tempAlert');";
@@ -531,16 +570,15 @@ String getHTML() {
   // อัปเดตสถานะของแต่ละ Step
   html += "  document.getElementById('step1').className = 'section status-' + data.step1Status.toLowerCase();";
   html += "  document.getElementById('step1Status').innerText = data.step1Status;";
-  html += "  document.getElementById('step2').className = 'section status-' + data.step2Status.toLowerCase();";
+  html += "  document.getElementById('step1EnvStatus').innerText = data.step1EnvStatus;";
+  html += "  document.getElementById('step2').className = 'section compact status-' + data.step2Status.toLowerCase();";
   html += "  document.getElementById('step2Status').innerText = data.step2Status;";
   html += "  document.getElementById('step3').className = 'section status-' + data.step3Status.toLowerCase();";
   html += "  document.getElementById('step3Status').innerText = data.step3Status;";
-  html += "  document.getElementById('step4').className = 'section status-' + data.step4Status.toLowerCase();";
+  html += "  document.getElementById('step4').className = 'section compact status-' + data.step4Status.toLowerCase();";
   html += "  document.getElementById('step4Status').innerText = data.step4Status;";
   html += "  document.getElementById('step5').className = 'section status-' + data.step5Status.toLowerCase();";
   html += "  document.getElementById('step5Status').innerText = data.step5Status;";
-  html += "  document.getElementById('step6').className = 'section status-' + data.step6Status.toLowerCase();";
-  html += "  document.getElementById('step6Status').innerText = data.step6Status;";
   html += "};";
   html += "</script>";
 
@@ -630,7 +668,7 @@ void loop() {
     String batchStatus = (batchCount == batchSize) ? "Pass" : "Fail";
     String finalStatus = (finalCount == batchSize) ? "Pass" : "Fail";
     String tempStatus = (finalBatchTemp <= tempLimit && finalBatchTemp != -1) ? "Pass" : "Fail";
-    String tempAlert = (finalBatchTemp > tempLimit) ? "Warning: Temperature too high" : "";
+    String tempAlert = (finalBatchTemp > tempLimit && finalBatchTemp != -1) ? "Fail" : "";
 
     if (req.indexOf("/data") != -1) {
       String html = getHTML();
@@ -648,12 +686,15 @@ void loop() {
       tempMax = -100.0;
       tempMin = 100.0;
       finalBatchTemp = -1.0;
+      finalBatchHumidity = -1.0;
       step1Status = "Waiting";
+      step1EnvStatus = "Waiting";
       step2Status = "Waiting";
       step3Status = "Waiting";
       step4Status = "Waiting";
       step5Status = "Waiting";
-      step6Status = "Waiting";
+      fillingTimerStarted = false;
+      mixingTimerStarted = false;
       client.println("HTTP/1.1 303 See Other");
       client.println("Location: /data");
       client.println();
@@ -668,12 +709,15 @@ void loop() {
       tempMax = -100.0;
       tempMin = 100.0;
       finalBatchTemp = -1.0;
+      finalBatchHumidity = -1.0;
       step1Status = "Waiting";
+      step1EnvStatus = "Waiting";
       step2Status = "Waiting";
       step3Status = "Waiting";
       step4Status = "Waiting";
       step5Status = "Waiting";
-      step6Status = "Waiting";
+      fillingTimerStarted = false;
+      mixingTimerStarted = false;
       client.println("HTTP/1.1 303 See Other");
       client.println("Location: /data");
       client.println();
@@ -690,43 +734,50 @@ void loop() {
   // อัปเดตสถานะของแต่ละ Step ตาม processPhase
   if (processPhase == 0) {  // Phase 1: Material Count
     step1Status = "Active";
+    step1EnvStatus = "Active";
+    step2Status = "Waiting";
+    step3Status = "Waiting";
+    step4Status = "Waiting";
+    step5Status = "Waiting";
+  } else if (processPhase == 1) {  // Phase 2: Filling Process
+    step1Status = "Completed";
+    step1EnvStatus = "Completed";
     step2Status = "Active";
     step3Status = "Waiting";
     step4Status = "Waiting";
     step5Status = "Waiting";
-    step6Status = "Waiting";
-  } else if (processPhase == 1) {  // Phase 2: Items After Filling
+  } else if (processPhase == 2) {  // Phase 3: Items After Filling
     step1Status = "Completed";
+    step1EnvStatus = "Completed";
     step2Status = "Completed";
     step3Status = "Active";
     step4Status = "Waiting";
+    step5Status = "Waiting";
+  } else if (processPhase == 3) {  // Phase 4: Mixing Process
+    step1Status = "Completed";
+    step1EnvStatus = "Completed";
+    step2Status = "Completed";
+    step3Status = "Completed";
+    step4Status = "Active";
+    step5Status = "Waiting";
+  } else if (processPhase == 4) {  // Phase 5: Items After Mixing
+    step1Status = "Completed";
+    step1EnvStatus = "Completed";
+    step2Status = "Completed";
+    step3Status = "Completed";
+    step4Status = "Completed";
     step5Status = "Active";
-    step6Status = "Waiting";
-  } else if (processPhase == 2) {  // Phase 3: Mixing Process
-    step1Status = "Completed";
-    step2Status = "Completed";
-    step3Status = "Completed";
-    step4Status = "Completed";
-    step5Status = "Completed";
-    step6Status = "Waiting";
-  } else if (processPhase == 3) {  // Phase 4: Items After Mixing
-    step1Status = "Completed";
-    step2Status = "Completed";
-    step3Status = "Completed";
-    step4Status = "Completed";
-    step5Status = "Completed";
-    step6Status = "Active";
   }
 
   // ตรวจสอบข้อผิดพลาดของเซ็นเซอร์
   if (temperature1 == -1 || humidity1 == -1) {
-    step2Status = "Error";
+    step1EnvStatus = "Error";
   }
-  if (finalBatchTemp == -1 && processPhase >= 2) {
-    step4Status = "Error";
+  if (finalBatchTemp == -1 && processPhase >= 2) {  // ตรวจสอบใน Step 3
+    step3Status = "Error";
   }
 
-  // อ่านอุณหภูมิจาก DHT22 ตัวที่ 1 (ระหว่างเติม) - Step 2
+  // อ่านอุณหภูมิและความชื้นจาก DHT22 ตัวที่ 1 (Step 1: Environment Monitoring)
   static unsigned long lastDHT1Read = 0;
   if (millis() - lastDHT1Read > 2000) {  // อ่าน DHT1 ทุก 2 วินาที
     float temp = dht1.readTemperature();
@@ -746,20 +797,37 @@ void loop() {
     lastDHT1Read = millis();
   }
 
-  // ส่งข้อมูลผ่าน WebSocket ทุก 5 วินาที
-  static unsigned long lastUpdate = 0;
-  if (millis() - lastUpdate > 5000) {
+  // ส่งข้อมูลผ่าน WebSocket เฉพาะเมื่อข้อมูลเปลี่ยนแปลง
+  bool dataChanged = (materialCount != prevMaterialCount ||
+                      batchCount != prevBatchCount ||
+                      finalCount != prevFinalCount ||
+                      temperature1 != prevTemperature1 ||
+                      humidity1 != prevHumidity1 ||
+                      finalBatchTemp != prevFinalBatchTemp ||
+                      finalBatchHumidity != prevFinalBatchHumidity ||
+                      isFirstWebSocket);
+
+  if (dataChanged) {
     String materialStatus = (materialCount >= materialTarget) ? "OK" : "Not OK";
     String batchStatus = (batchCount == batchSize) ? "Pass" : "Fail";
     String finalStatus = (finalCount == batchSize) ? "Pass" : "Fail";
     String tempStatus = (finalBatchTemp <= tempLimit && finalBatchTemp != -1) ? "Pass" : "Fail";
-    String tempAlert = (finalBatchTemp > tempLimit) ? "Warning: Temperature too high" : "";
+    String tempAlert = (finalBatchTemp > tempLimit && finalBatchTemp != -1) ? "Fail" : "";
 
-    String json = getDataAsJson(temperature1, humidity1, finalBatchTemp, materialStatus, batchStatus, finalStatus, tempStatus, tempAlert);
+    String json = getDataAsJson(temperature1, humidity1, finalBatchTemp, finalBatchHumidity, materialStatus, batchStatus, finalStatus, tempStatus, tempAlert);
     webSocket.broadcastTXT(json);
     Serial.print("WebSocket JSON sent: ");
     Serial.println(json);
-    lastUpdate = millis();
+
+    // อัปเดตค่าก่อนหน้า
+    prevMaterialCount = materialCount;
+    prevBatchCount = batchCount;
+    prevFinalCount = finalCount;
+    prevTemperature1 = temperature1;
+    prevHumidity1 = humidity1;
+    prevFinalBatchTemp = finalBatchTemp;
+    prevFinalBatchHumidity = finalBatchHumidity;
+    isFirstWebSocket = false;  // รีเซ็ตหลังจากส่งครั้งแรก
   }
 
   // อ่านสถานะของ IR Sensor 1 (GPIO 13) สำหรับ Step 1: นับวัตถุดิบ
@@ -770,38 +838,92 @@ void loop() {
       Serial.print("Step 1 - Material Count: ");
       Serial.println(materialCount);
       if (materialCount >= materialTarget) {
-        processPhase = 1;  // เปลี่ยนไป Phase 2: Items After Filling
-        Serial.println("Material Count reached target. Switching to Phase 2 (Items After Filling)");
+        processPhase = 1;  // เปลี่ยนไป Phase 2: Filling Process
+        fillingTimerStarted = true;  // เริ่มจับเวลา Filling Process
+        fillingStartTime = millis();  // บันทึกเวลาเริ่มต้น
+        Serial.println("Material Count reached target. Switching to Phase 2 (Filling Process)");
       }
     }
   }
   lastState1 = sensorState1;
 
-  // อ่านสถานะของ IR Sensor 2 (GPIO 14) สำหรับ Step 5: นับสินค้าหลังเติม
+  // ตรวจสอบระยะเวลาใน Filling Process (Phase 1)
+  if (processPhase == 1 && fillingTimerStarted) {
+    if (millis() - fillingStartTime >= fillingDuration) {
+      processPhase = 2;  // เปลี่ยนไป Phase 3: Items After Filling
+      fillingTimerStarted = false;  // รีเซ็ตตัวจับเวลา
+      Serial.println("Filling Process completed after 10 seconds. Switching to Phase 3 (Items After Filling)");
+    }
+  }
+
+  // อ่านสถานะของ IR Sensor 2 (GPIO 14) สำหรับ Step 3: Items After Filling
   int sensorState2 = digitalRead(IR_PIN_2);
-  if (processPhase == 1) {  // Phase 2: Items After Filling
+  if (processPhase == 2) {  // Phase 3: Items After Filling
     if (sensorState2 == LOW && lastState2 == HIGH) {
       batchCount++;
       totalItems++;
-      Serial.print("Step 5 - Items After Filling: ");
+      Serial.print("Step 3 - Items After Filling: ");
       Serial.println(batchCount);
+
+      // วัดอุณหภูมิและความชื้นจาก DHT22 ตัวที่ 2
+      float temp = dht2.readTemperature();
+      float hum = dht2.readHumidity();
+      if (!isnan(temp) && !isnan(hum)) {
+        finalBatchTemp = temp;
+        finalBatchHumidity = hum;
+        Serial.print("Step 3 - Final Batch Temperature (DHT2): ");
+        Serial.print(finalBatchTemp);
+        Serial.print(" C, Final Batch Humidity (DHT2): ");
+        Serial.print(finalBatchHumidity);
+        Serial.println(" %");
+      } else {
+        finalBatchTemp = -1;
+        finalBatchHumidity = -1;
+        Serial.println("Failed to read DHT2 during Items After Filling");
+      }
+
       if (batchCount >= batchSize) {
-        // อ่านอุณหภูมิจาก DHT22 ตัวที่ 2 เมื่อแบทช์เสร็จ (Step 4)
-        finalBatchTemp = dht2.readTemperature();
-        if (isnan(finalBatchTemp)) {
-          finalBatchTemp = -1;
-          Serial.println("Failed to read DHT2 at batch completion");
-        } else {
-          Serial.print("Step 4 - Final Batch Temperature (DHT2): ");
-          Serial.print(finalBatchTemp);
-          Serial.println(" C");
-        }
-        processPhase = 2;  // เปลี่ยนไป Phase 3: Mixing Process
-        Serial.println("Switching to Phase 3 (Mixing Process)");
+        processPhase = 3;  // เปลี่ยนไป Phase 4: Mixing Process
+        mixingTimerStarted = true;  // เริ่มจับเวลา Mixing Process
+        mixingStartTime = millis();  // บันทึกเวลาเริ่มต้น
+        Serial.println("Items After Filling completed. Switching to Phase 4 (Mixing Process)");
       }
     }
   }
   lastState2 = sensorState2;
+
+  // ตรวจสอบระยะเวลาใน Mixing Process (Phase 3)
+  if (processPhase == 3 && mixingTimerStarted) {
+    if (millis() - mixingStartTime >= mixingDuration) {
+      processPhase = 4;  // เปลี่ยนไป Phase 5: Items After Mixing
+      mixingTimerStarted = false;  // รีเซ็ตตัวจับเวลา
+      Serial.println("Mixing Process completed after 10 seconds. Switching to Phase 5 (Items After Mixing)");
+    }
+  }
+
+  // อ่านสถานะของ IR Sensor 3 (GPIO 12) สำหรับ Step 5: Items After Mixing
+  int sensorState3 = digitalRead(IR_PIN_3);
+  if (processPhase == 4) {  // Phase 5: Items After Mixing
+    if (sensorState3 == LOW && lastState3 == HIGH) {
+      finalCount++;
+      totalItems++;
+      Serial.print("Step 5 - Items After Mixing: ");
+      Serial.println(finalCount);
+      if (finalCount >= batchSize) {
+        batchNumber++;  // เพิ่ม batchNumber หลังจาก Step 5 เสร็จ
+        Serial.print("Batch Number incremented to: ");
+        Serial.println(batchNumber);
+        finalCount = 0;
+        batchCount = 0;  // รีเซ็ต batchCount
+        materialCount = 0;  // รีเซ็ต materialCount
+        processPhase = 0;  // กลับไป Phase 1
+        finalBatchTemp = -1.0;  // รีเซ็ต finalBatchTemp
+        finalBatchHumidity = -1.0;  // รีเซ็ต finalBatchHumidity
+        Serial.println("Final Count reset to 0, Batch Count reset to 0, Material Count reset to 0, Final Batch Temp reset to -1, Final Batch Humidity reset to -1, Switching back to Phase 1");
+      }
+    }
+  }
+  lastState3 = sensorState3;
 
   // Debug: ตรวจสอบสถานะ
   static unsigned long lastDebug = 0;
@@ -810,61 +932,20 @@ void loop() {
     Serial.println(sensorState1);
     Serial.print("IR Sensor 2 State: ");
     Serial.println(sensorState2);
+    Serial.print("IR Sensor 3 State: ");
+    Serial.println(sensorState3);
     Serial.print("Process Phase: ");
     Serial.println(processPhase == 0 ? "Phase 1 (Material Count)" : 
-                   processPhase == 1 ? "Phase 2 (Items After Filling)" : 
-                   processPhase == 2 ? "Phase 3 (Mixing Process)" : 
-                   "Phase 4 (Items After Mixing)");
+                   processPhase == 1 ? "Phase 2 (Filling Process)" : 
+                   processPhase == 2 ? "Phase 3 (Items After Filling)" : 
+                   processPhase == 3 ? "Phase 4 (Mixing Process)" : 
+                   "Phase 5 (Items After Mixing)");
     Serial.print("Material Count: ");
     Serial.println(materialCount);
     Serial.print("Batch Count: ");
     Serial.println(batchCount);
     Serial.print("Batch Number: ");
     Serial.println(batchNumber);
-    lastDebug = millis();
-  }
-
-  // ขั้นตอน 6: นับสินค้าหลังผสม (Step 6: Items After Mixing) ใช้ IR Sensor 3 (GPIO 12)
-  int sensorState3 = digitalRead(IR_PIN_3);
-  if (processPhase == 3) {  // Phase 4: Items After Mixing
-    if (sensorState3 == LOW && lastState3 == HIGH) {
-      finalCount++;
-      totalItems++;
-      Serial.print("Step 6 - Items After Mixing: ");
-      Serial.println(finalCount);
-      if (finalCount >= batchSize) {
-        batchNumber++;  // เพิ่ม batchNumber หลังจาก Step 6 เสร็จ
-        Serial.print("Batch Number incremented to: ");
-        Serial.println(batchNumber);
-        finalCount = 0;
-        batchCount = 0;  // รีเซ็ต batchCount
-        materialCount = 0;  // รีเซ็ต materialCount
-        processPhase = 0;  // กลับไป Phase 1
-        finalBatchTemp = -1.0;  // รีเซ็ต finalBatchTemp
-        Serial.println("Final Count reset to 0, Batch Count reset to 0, Material Count reset to 0, Final Batch Temp reset to -1, Switching back to Phase 1");
-      }
-    }
-  }
-  lastState3 = sensorState3;
-
-  // เปลี่ยนไป Phase 4 (Items After Mixing) หลังจาก Mixing Process
-  if (processPhase == 2) {
-    // สมมติว่า Mixing Process ใช้เวลา 5 วินาที (สามารถปรับได้ตามจริง)
-    static unsigned long mixingStart = 0;
-    if (mixingStart == 0) {
-      mixingStart = millis();
-    }
-    if (millis() - mixingStart >= 5000) {  // 5 วินาที
-      processPhase = 3;  // เปลี่ยนไป Phase 4: Items After Mixing
-      mixingStart = 0;
-      Serial.println("Mixing Process completed. Switching to Phase 4 (Items After Mixing)");
-    }
-  }
-
-  // Debug: ตรวจสอบ IR Sensor 3
-  if (millis() - lastDebug > 15000) {
-    Serial.print("IR Sensor 3 State: ");
-    Serial.println(sensorState3);
     lastDebug = millis();
   }
 
